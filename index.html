@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<!--
+用法：
+1) 直接在浏览器打开本文件。
+2) 使用 F / k 滑块调整参数（调整后会自动重置并重新开始）。
+3) 选择颜色映射（jet / magma / viridis / grayscale）。
+4) 点击“暂停/继续”控制演化，点击“重置”恢复初始条件。
+5) 在画布上点击或拖拽可注入 V（局部扰动）。
+-->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Gray-Scott 反应扩散可视化</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, "PingFang SC", "Noto Sans CJK SC", sans-serif;
+      background: #111;
+      color: #eee;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
+      padding: 16px;
+    }
+    .panel {
+      width: 600px;
+      background: #1b1b1b;
+      border: 1px solid #333;
+      border-radius: 8px;
+      padding: 12px;
+      box-sizing: border-box;
+      display: grid;
+      gap: 10px;
+    }
+    .row {
+      display: grid;
+      grid-template-columns: 70px 1fr auto;
+      align-items: center;
+      gap: 10px;
+    }
+    .row select, .row button, .row input[type="range"] { width: 100%; }
+    .buttons {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+    button {
+      cursor: pointer;
+      border: 1px solid #444;
+      border-radius: 6px;
+      background: #292929;
+      color: #eee;
+      padding: 8px 10px;
+    }
+    button:hover { background: #333; }
+    canvas {
+      width: 600px;
+      height: 600px;
+      border: 1px solid #333;
+      image-rendering: pixelated;
+      cursor: crosshair;
+    }
+    .stats { font-variant-numeric: tabular-nums; color: #cfcfcf; }
+  </style>
+</head>
+<body>
+  <div class="panel">
+    <div class="row">
+      <label for="fSlider">F</label>
+      <input id="fSlider" type="range" min="0.01" max="0.07" step="0.001" value="0.0545" />
+      <span id="fValue">0.0545</span>
+    </div>
+    <div class="row">
+      <label for="kSlider">k</label>
+      <input id="kSlider" type="range" min="0.04" max="0.07" step="0.001" value="0.0620" />
+      <span id="kValue">0.0620</span>
+    </div>
+    <div class="row">
+      <label for="colormap">颜色</label>
+      <select id="colormap">
+        <option value="jet">jet</option>
+        <option value="magma" selected>magma</option>
+        <option value="viridis">viridis</option>
+        <option value="grayscale">grayscale</option>
+      </select>
+      <span></span>
+    </div>
+    <div class="buttons">
+      <button id="resetBtn">重置</button>
+      <button id="pauseBtn">暂停</button>
+    </div>
+    <div class="stats" id="stats">F=0.0545, k=0.0620, step=0</div>
+  </div>
+
+  <canvas id="simCanvas" width="600" height="600"></canvas>
+
+  <script>
+    (() => {
+      const N = 128;
+      const CANVAS_SIZE = 600;
+      const DU = 0.16;
+      const DV = 0.08;
+      const INJECT_AMOUNT = 0.2;
+
+      const canvas = document.getElementById('simCanvas');
+      const ctx = canvas.getContext('2d', { alpha: false });
+      ctx.imageSmoothingEnabled = false;
+
+      const offscreen = document.createElement('canvas');
+      offscreen.width = N;
+      offscreen.height = N;
+      const offCtx = offscreen.getContext('2d', { alpha: false });
+      const imageData = offCtx.createImageData(N, N);
+      const pixels = imageData.data;
+
+      const fSlider = document.getElementById('fSlider');
+      const kSlider = document.getElementById('kSlider');
+      const fValue = document.getElementById('fValue');
+      const kValue = document.getElementById('kValue');
+      const colormapSelect = document.getElementById('colormap');
+      const resetBtn = document.getElementById('resetBtn');
+      const pauseBtn = document.getElementById('pauseBtn');
+      const stats = document.getElementById('stats');
+
+      let F = parseFloat(fSlider.value);
+      let K = parseFloat(kSlider.value);
+      let step = 0;
+      let paused = false;
+
+      let U = new Float32Array(N * N);
+      let V = new Float32Array(N * N);
+      let U2 = new Float32Array(N * N);
+      let V2 = new Float32Array(N * N);
+
+      const COLOR_STOPS = {
+        grayscale: [
+          [0, 0, 0], [255, 255, 255]
+        ],
+        jet: [
+          [0, 0, 128], [0, 0, 255], [0, 255, 255], [255, 255, 0], [255, 0, 0], [128, 0, 0]
+        ],
+        viridis: [
+          [68, 1, 84], [71, 44, 122], [59, 81, 139], [44, 113, 142], [33, 144, 141], [39, 173, 129], [92, 200, 99], [170, 220, 50], [253, 231, 37]
+        ],
+        magma: [
+          [0, 0, 4], [28, 16, 68], [79, 18, 123], [129, 37, 129], [181, 54, 122], [229, 80, 100], [251, 135, 97], [254, 194, 135], [252, 253, 191]
+        ]
+      };
+
+      function buildLUT(stops) {
+        const lut = new Uint8ClampedArray(256 * 3);
+        const segments = stops.length - 1;
+        for (let i = 0; i < 256; i++) {
+          const t = i / 255;
+          const s = Math.min(segments - 1, Math.floor(t * segments));
+          const localT = (t - s / segments) * segments;
+          const a = stops[s];
+          const b = stops[s + 1];
+          lut[i * 3] = Math.round(a[0] + (b[0] - a[0]) * localT);
+          lut[i * 3 + 1] = Math.round(a[1] + (b[1] - a[1]) * localT);
+          lut[i * 3 + 2] = Math.round(a[2] + (b[2] - a[2]) * localT);
+        }
+        return lut;
+      }
+
+      const LUTS = {
+        grayscale: buildLUT(COLOR_STOPS.grayscale),
+        jet: buildLUT(COLOR_STOPS.jet),
+        viridis: buildLUT(COLOR_STOPS.viridis),
+        magma: buildLUT(COLOR_STOPS.magma)
+      };
+      let activeLUT = LUTS[colormapSelect.value];
+
+      function clamp01(x) {
+        if (x < 0) return 0;
+        if (x > 1) return 1;
+        return x;
+      }
+
+      function resetSimulation() {
+        U.fill(1.0);
+        V.fill(0.0);
+        U2.fill(1.0);
+        V2.fill(0.0);
+
+        const half = 10;
+        const c = (N / 2) | 0;
+        for (let i = c - half; i < c + half; i++) {
+          for (let j = c - half; j < c + half; j++) {
+            const idx = i * N + j;
+            U[idx] = 0.5;
+            V[idx] = 0.25;
+          }
+        }
+
+        for (let idx = 0; idx < N * N; idx++) {
+          U[idx] = clamp01(U[idx] + Math.random() * 0.01);
+          V[idx] = clamp01(V[idx] + Math.random() * 0.01);
+        }
+
+        step = 0;
+        updateLabels();
+        render();
+      }
+
+      function updateLabels() {
+        fValue.textContent = F.toFixed(4);
+        kValue.textContent = K.toFixed(4);
+        stats.textContent = `F=${F.toFixed(4)}, k=${K.toFixed(4)}, step=${step}`;
+      }
+
+      function simulateOneStep() {
+        for (let i = 0; i < N; i++) {
+          const im = i === 0 ? 1 : i - 1;
+          const ip = i === N - 1 ? N - 2 : i + 1;
+          for (let j = 0; j < N; j++) {
+            const jm = j === 0 ? 1 : j - 1;
+            const jp = j === N - 1 ? N - 2 : j + 1;
+
+            const idx = i * N + j;
+            const u = U[idx];
+            const v = V[idx];
+
+            const lapU = U[im * N + j] + U[ip * N + j] + U[i * N + jm] + U[i * N + jp] - 4 * u;
+            const lapV = V[im * N + j] + V[ip * N + j] + V[i * N + jm] + V[i * N + jp] - 4 * v;
+            const uvv = u * v * v;
+
+            let un = u + (DU * lapU - uvv + F * (1 - u));
+            let vn = v + (DV * lapV + uvv - (F + K) * v);
+            U2[idx] = clamp01(un);
+            V2[idx] = clamp01(vn);
+          }
+        }
+
+        [U, U2] = [U2, U];
+        [V, V2] = [V2, V];
+        step++;
+      }
+
+      function render() {
+        for (let idx = 0; idx < N * N; idx++) {
+          const v = V[idx];
+          const c = (v <= 0 ? 0 : v >= 1 ? 255 : (v * 255) | 0) * 3;
+          const p = idx * 4;
+          pixels[p] = activeLUT[c];
+          pixels[p + 1] = activeLUT[c + 1];
+          pixels[p + 2] = activeLUT[c + 2];
+          pixels[p + 3] = 255;
+        }
+
+        offCtx.putImageData(imageData, 0, 0);
+        ctx.drawImage(offscreen, 0, 0, CANVAS_SIZE, CANVAS_SIZE);
+      }
+
+      function animate() {
+        if (!paused) {
+          simulateOneStep();
+          render();
+          updateLabels();
+        }
+        requestAnimationFrame(animate);
+      }
+
+      function injectAt(clientX, clientY) {
+        const rect = canvas.getBoundingClientRect();
+        const x = ((clientX - rect.left) / rect.width) * N;
+        const y = ((clientY - rect.top) / rect.height) * N;
+        const cx = Math.floor(x);
+        const cy = Math.floor(y);
+        const r = 2;
+
+        for (let dy = -r; dy <= r; dy++) {
+          for (let dx = -r; dx <= r; dx++) {
+            const gx = cx + dx;
+            const gy = cy + dy;
+            if (gx < 0 || gx >= N || gy < 0 || gy >= N) continue;
+            const idx = gy * N + gx;
+            V[idx] = clamp01(V[idx] + INJECT_AMOUNT);
+            U[idx] = clamp01(U[idx] - INJECT_AMOUNT * 0.5);
+          }
+        }
+      }
+
+      function onParamsChanged() {
+        F = parseFloat(fSlider.value);
+        K = parseFloat(kSlider.value);
+        paused = false;
+        pauseBtn.textContent = '暂停';
+        resetSimulation();
+      }
+
+      fSlider.addEventListener('input', onParamsChanged, { passive: true });
+      kSlider.addEventListener('input', onParamsChanged, { passive: true });
+
+      colormapSelect.addEventListener('change', () => {
+        activeLUT = LUTS[colormapSelect.value];
+        render();
+      });
+
+      resetBtn.addEventListener('click', () => {
+        resetSimulation();
+      });
+
+      pauseBtn.addEventListener('click', () => {
+        paused = !paused;
+        pauseBtn.textContent = paused ? '继续' : '暂停';
+      });
+
+      let drawing = false;
+      canvas.addEventListener('pointerdown', (e) => {
+        drawing = true;
+        injectAt(e.clientX, e.clientY);
+        canvas.setPointerCapture(e.pointerId);
+      });
+      canvas.addEventListener('pointermove', (e) => {
+        if (!drawing) return;
+        injectAt(e.clientX, e.clientY);
+      });
+      canvas.addEventListener('pointerup', () => { drawing = false; });
+      canvas.addEventListener('pointercancel', () => { drawing = false; });
+      canvas.addEventListener('pointerleave', () => { drawing = false; });
+
+      resetSimulation();
+      requestAnimationFrame(animate);
+    })();
+  </script>
+</body>
+</html>
