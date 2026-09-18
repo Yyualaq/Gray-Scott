@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BZ 反应扩散（Oregonator）</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin: 0;
+      padding: 16px;
+      background: #101114;
+      color: #e9e9ea;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, "PingFang SC", "Noto Sans CJK SC", sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
+    }
+    .panel {
+      width: 560px;
+      border: 1px solid #2c2f36;
+      background: #181b22;
+      border-radius: 8px;
+      padding: 12px;
+      box-sizing: border-box;
+      display: grid;
+      gap: 10px;
+    }
+    .row {
+      display: grid;
+      grid-template-columns: 95px 1fr auto;
+      gap: 10px;
+      align-items: center;
+    }
+    .row input[type="range"], .row select, button { width: 100%; }
+    .btns {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+    button {
+      border: 1px solid #383d48;
+      background: #262b35;
+      color: #f0f0f0;
+      border-radius: 6px;
+      padding: 8px 10px;
+      cursor: pointer;
+    }
+    button:hover { background: #2f3541; }
+    canvas {
+      width: 512px;
+      height: 512px;
+      border: 1px solid #2c2f36;
+      image-rendering: pixelated;
+      cursor: crosshair;
+    }
+    .stats { font-variant-numeric: tabular-nums; color: #d6d6d6; }
+    .hint { color: #f0c674; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <div class="panel">
+    <div class="row">
+      <label for="fSlider">f 参数</label>
+      <input id="fSlider" type="range" min="0.5" max="2.5" step="0.1" value="1.4" />
+      <span id="fValue">1.4</span>
+    </div>
+    <div class="row">
+      <label for="ratioSlider">Dv/Du</label>
+      <input id="ratioSlider" type="range" min="0.1" max="1.0" step="0.1" value="0.6" />
+      <span id="ratioValue">0.6</span>
+    </div>
+    <div class="row">
+      <label for="colormap">颜色映射</label>
+      <select id="colormap">
+        <option value="fire" selected>fire</option>
+        <option value="ocean">ocean</option>
+        <option value="viridis">viridis</option>
+        <option value="grayscale">grayscale</option>
+      </select>
+      <span></span>
+    </div>
+    <div class="btns">
+      <button id="resetBtn">重置</button>
+      <button id="pauseBtn">暂停</button>
+    </div>
+    <div id="stats" class="stats"></div>
+  </div>
+
+  <canvas id="simCanvas" width="512" height="512"></canvas>
+  <div class="hint">如果图案消失，请尝试增大 f 值（1.4→1.8）或减小扩散比（0.6→0.3）</div>
+
+  <script>
+    (() => {
+      // --- 模型与离散化参数（稳定性关键） ---
+      // Oregonator:
+      // du/dt = Du*∇²u + (1/ε)[u - u² - f*v*(u-q)/(u+q)]
+      // dv/dt = Dv*∇²v + u - v
+      const N = 128;
+      const CANVAS_SIZE = 512;
+      const CELL_SIZE = CANVAS_SIZE / N; // 4 像素/格
+
+      const EPS = 0.03;
+      const Q = 0.002;
+      const DU = 1.0;
+      const DT = 0.001; // 显式格式的小时间步，抑制闪现后消失
+      const SUBSTEPS_PER_FRAME = 5; // 每帧 5 个子步 => 每帧总时间 0.005
+
+      const INIT_U = 0.5;
+      const INIT_V = 0.5;
+      const CENTER_RADIUS_PX = 20;
+      const PERTURB_AMPLITUDE = 0.025; // ±0.025 即 5% 扰动
+      const INJECT_RADIUS_PX = 12;
+
+      const canvas = document.getElementById('simCanvas');
+      const ctx = canvas.getContext('2d', { alpha: false });
+      ctx.imageSmoothingEnabled = false;
+
+      const offscreen = document.createElement('canvas');
+      offscreen.width = N;
+      offscreen.height = N;
+      const offCtx = offscreen.getContext('2d', { alpha: false });
+      const imageData = offCtx.createImageData(N, N);
+      const pixels = imageData.data;
+
+      const fSlider = document.getElementById('fSlider');
+      const ratioSlider = document.getElementById('ratioSlider');
+      const colormap = document.getElementById('colormap');
+      const resetBtn = document.getElementById('resetBtn');
+      const pauseBtn = document.getElementById('pauseBtn');
+      const fValue = document.getElementById('fValue');
+      const ratioValue = document.getElementById('ratioValue');
+      const stats = document.getElementById('stats');
+
+      let f = parseFloat(fSlider.value);
+      let ratio = parseFloat(ratioSlider.value);
+      let dv = DU * ratio;
+      let paused = false;
+      let step = 0;
+      let meanV = 0;
+
+      let u = new Float32Array(N * N);
+      let v = new Float32Array(N * N);
+      let uNext = new Float32Array(N * N);
+      let vNext = new Float32Array(N * N);
+
+      const clampFinite = (x) => {
+        if (!Number.isFinite(x)) return 0;
+        if (x < 0) return 0;
+        if (x > 2) return 2;
+        return x;
+      };
+
+      const COLOR_STOPS = {
+        fire: [[0, 0, 0], [90, 0, 0], [180, 40, 0], [255, 120, 0], [255, 220, 120], [255, 255, 255]],
+        ocean: [[0, 0, 0], [0, 20, 90], [0, 90, 170], [0, 160, 200], [120, 230, 255], [240, 255, 255]],
+        viridis: [[68, 1, 84], [71, 44, 122], [59, 81, 139], [44, 113, 142], [33, 144, 141], [39, 173, 129], [92, 200, 99], [170, 220, 50], [253, 231, 37]],
+        grayscale: [[0, 0, 0], [255, 255, 255]]
+      };
+
+      function buildLUT(stops) {
+        const lut = new Uint8ClampedArray(256 * 3);
+        const segCount = stops.length - 1;
+        for (let i = 0; i < 256; i++) {
+          const t = i / 255;
+          const seg = Math.min(segCount - 1, Math.floor(t * segCount));
+          const local = (t - seg / segCount) * segCount;
+          const a = stops[seg];
+          const b = stops[seg + 1];
+          const p = i * 3;
+          lut[p] = Math.round(a[0] + (b[0] - a[0]) * local);
+          lut[p + 1] = Math.round(a[1] + (b[1] - a[1]) * local);
+          lut[p + 2] = Math.round(a[2] + (b[2] - a[2]) * local);
+        }
+        return lut;
+      }
+
+      const LUTS = {
+        fire: buildLUT(COLOR_STOPS.fire),
+        ocean: buildLUT(COLOR_STOPS.ocean),
+        viridis: buildLUT(COLOR_STOPS.viridis),
+        grayscale: buildLUT(COLOR_STOPS.grayscale)
+      };
+      let activeLUT = LUTS.fire;
+
+      function updateStats() {
+        fValue.textContent = f.toFixed(1);
+        ratioValue.textContent = ratio.toFixed(1);
+        stats.textContent = `f=${f.toFixed(1)} | Dv/Du=${ratio.toFixed(1)} | 迭代步=${step} | 平均v=${meanV.toFixed(4)}`;
+      }
+
+      function resetSimulation() {
+        u.fill(INIT_U);
+        v.fill(INIT_V);
+        uNext.fill(INIT_U);
+        vNext.fill(INIT_V);
+
+        const center = Math.floor(N / 2);
+        const rCell = CENTER_RADIUS_PX / CELL_SIZE;
+        const r2 = rCell * rCell;
+
+        for (let y = 0; y < N; y++) {
+          for (let x = 0; x < N; x++) {
+            const dx = x - center;
+            const dy = y - center;
+            const idx = y * N + x;
+            if (dx * dx + dy * dy <= r2) {
+              u[idx] = 1.0;
+              v[idx] = 0.0;
+            }
+
+            // 5% 均匀扰动：[-0.025, +0.025]
+            u[idx] = clampFinite(u[idx] + (Math.random() * 2 - 1) * PERTURB_AMPLITUDE);
+            v[idx] = clampFinite(v[idx] + (Math.random() * 2 - 1) * PERTURB_AMPLITUDE);
+          }
+        }
+
+        step = 0;
+        render();
+        updateStats();
+      }
+
+      function stepOnce() {
+        const invEps = 1 / EPS;
+        for (let y = 0; y < N; y++) {
+          const ym = y === 0 ? 1 : y - 1;
+          const yp = y === N - 1 ? N - 2 : y + 1;
+          for (let x = 0; x < N; x++) {
+            const xm = x === 0 ? 1 : x - 1;
+            const xp = x === N - 1 ? N - 2 : x + 1;
+
+            const idx = y * N + x;
+            const u0 = u[idx];
+            const v0 = v[idx];
+
+            // 5 点拉普拉斯 + Neumann(反射) 边界
+            const lapU = u[ym * N + x] + u[yp * N + x] + u[y * N + xm] + u[y * N + xp] - 4 * u0;
+            const lapV = v[ym * N + x] + v[yp * N + x] + v[y * N + xm] + v[y * N + xp] - 4 * v0;
+
+            const reactionU = u0 - u0 * u0 - f * v0 * (u0 - Q) / (u0 + Q);
+            const du = DU * lapU + invEps * reactionU;
+            const dvdt = dv * lapV + u0 - v0;
+
+            uNext[idx] = clampFinite(u0 + DT * du);
+            vNext[idx] = clampFinite(v0 + DT * dvdt);
+          }
+        }
+
+        [u, uNext] = [uNext, u];
+        [v, vNext] = [vNext, v];
+        step++;
+      }
+
+      function render() {
+        let sumV = 0;
+        for (let i = 0; i < N * N; i++) {
+          const vv = v[i];
+          sumV += vv;
+          const mapped = vv <= 0 ? 0 : vv >= 1 ? 255 : (vv * 255) | 0;
+          const lutIdx = mapped * 3;
+          const p = i * 4;
+          pixels[p] = activeLUT[lutIdx];
+          pixels[p + 1] = activeLUT[lutIdx + 1];
+          pixels[p + 2] = activeLUT[lutIdx + 2];
+          pixels[p + 3] = 255;
+        }
+        meanV = sumV / (N * N);
+        offCtx.putImageData(imageData, 0, 0);
+        ctx.drawImage(offscreen, 0, 0, CANVAS_SIZE, CANVAS_SIZE);
+      }
+
+      function animate() {
+        if (!paused) {
+          for (let i = 0; i < SUBSTEPS_PER_FRAME; i++) stepOnce();
+          render();
+          updateStats();
+        }
+        requestAnimationFrame(animate);
+      }
+
+      function injectAt(clientX, clientY) {
+        const rect = canvas.getBoundingClientRect();
+        const gx = ((clientX - rect.left) / rect.width) * N;
+        const gy = ((clientY - rect.top) / rect.height) * N;
+        const cx = Math.floor(gx);
+        const cy = Math.floor(gy);
+        const rCell = INJECT_RADIUS_PX / CELL_SIZE;
+        const r2 = rCell * rCell;
+
+        for (let y = Math.max(0, Math.floor(cy - rCell)); y <= Math.min(N - 1, Math.ceil(cy + rCell)); y++) {
+          for (let x = Math.max(0, Math.floor(cx - rCell)); x <= Math.min(N - 1, Math.ceil(cx + rCell)); x++) {
+            const dx = x - cx;
+            const dy = y - cy;
+            if (dx * dx + dy * dy > r2) continue;
+            const idx = y * N + x;
+            u[idx] = 1.0;
+            v[idx] = 0.0;
+          }
+        }
+      }
+
+      function onParameterChanged() {
+        f = parseFloat(fSlider.value);
+        ratio = parseFloat(ratioSlider.value);
+        dv = DU * ratio;
+        paused = false;
+        pauseBtn.textContent = '暂停';
+        resetSimulation();
+      }
+
+      fSlider.addEventListener('input', onParameterChanged, { passive: true });
+      ratioSlider.addEventListener('input', onParameterChanged, { passive: true });
+
+      colormap.addEventListener('change', () => {
+        activeLUT = LUTS[colormap.value];
+        render();
+        updateStats();
+      });
+
+      resetBtn.addEventListener('click', resetSimulation);
+      pauseBtn.addEventListener('click', () => {
+        paused = !paused;
+        pauseBtn.textContent = paused ? '继续' : '暂停';
+      });
+
+      let drawing = false;
+      canvas.addEventListener('pointerdown', (e) => {
+        drawing = true;
+        injectAt(e.clientX, e.clientY);
+        canvas.setPointerCapture(e.pointerId);
+      });
+      canvas.addEventListener('pointermove', (e) => {
+        if (!drawing) return;
+        injectAt(e.clientX, e.clientY);
+      });
+      canvas.addEventListener('pointerup', () => { drawing = false; });
+      canvas.addEventListener('pointercancel', () => { drawing = false; });
+      canvas.addEventListener('pointerleave', () => { drawing = false; });
+
+      resetSimulation();
+      requestAnimationFrame(animate);
+    })();
+  </script>
+</body>
+</html>
